@@ -263,6 +263,44 @@
       },
       "additionalProperties": false
     },
+    "display_style": {
+      "type": "string",
+      "enum": [
+        "scroll",
+        "switch"
+      ],
+      "default": "scroll",
+      "description": "'scroll' runs every match of a mode across the panel as a ticker, like the other sports boards. 'switch' shows one match at a time for its game duration."
+    },
+    "scroll_settings": {
+      "type": "object",
+      "title": "Scroll Settings",
+      "description": "Used when display_style is 'scroll'. The cards are also what Vegas mode shows.",
+      "properties": {
+        "scroll_speed": {
+          "type": "number",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 400,
+          "description": "Scroll speed in pixels per second. Multiples of the panel refresh (e.g. 100 on a 100Hz panel) scroll the smoothest."
+        },
+        "card_width": {
+          "type": "integer",
+          "default": 128,
+          "minimum": 64,
+          "maximum": 512,
+          "description": "Width of each match card in pixels (capped at the panel width)."
+        },
+        "gap_between_cards": {
+          "type": "integer",
+          "default": 24,
+          "minimum": 0,
+          "maximum": 128,
+          "description": "Blank pixels between match cards."
+        }
+      },
+      "additionalProperties": false
+    },
     "celebration_enabled": {
       "type": "boolean",
       "x-advanced": true,
@@ -550,6 +588,8 @@
     "dynamic_duration",
     "mode_durations",
     "display_modes",
+    "display_style",
+    "scroll_settings",
     "background_service",
     "customization",
     "celebration_enabled",

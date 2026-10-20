@@ -1,7 +1,7 @@
 {
   "id": "cricket-plus",
   "name": "Cricket Plus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "StevenFay",
   "description": "ChuckBuilds' Cricket Scoreboard with team logos that download, country flags for national sides, and small crests beside each team's score. Tests, ODIs, T20Is, BBL, IPL, Sheffield Shield and more from ESPN.",
   "category": "sports",
@@ -35,6 +35,12 @@
     ">=2.0.0"
   ],
   "versions": [
+    {
+      "version": "1.1.0",
+      "released": "2026-10-20",
+      "ledmatrix_min_version": "2.0.0",
+      "notes": "Scroll mode: each mode's matches scroll across the panel as one strip of match cards, like the other sports boards (display_style, default scroll; scroll_settings for speed, card width and gap). The strip runs once per slot and is rebuilt with the latest scores. display_style 'switch' keeps one match at a time. Vegas mode uses the same card width."
+    },
     {
       "version": "1.0.0",
       "released": "2026-10-20",

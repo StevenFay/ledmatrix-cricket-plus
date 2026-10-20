@@ -29,6 +29,14 @@ except ImportError:
     BasePlugin = None
     VegasDisplayMode = None
 
+try:
+    # The core's scroll engine and its speed resolver (LEDMatrix >= 3.4).
+    from src.common.scroll_helper import ScrollHelper
+    from src.common import scroll_config as _scroll_config
+except ImportError:  # standalone tests without a core checkout
+    ScrollHelper = None
+    _scroll_config = None
+
 from cricket_data_fetcher import CricketDataFetcher
 from cricket_renderer import CricketRenderer
 
@@ -121,6 +129,8 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
         # after drawing, without naming the mode; see get_cycle_duration.
         self._last_display_mode: Optional[str] = None
 
+        self._setup_scroll()
+
         # No background data service: every fetch runs synchronously in
         # update() through self.fetcher. The service used to be created here
         # and never used, and because it is a process-wide singleton, creating
@@ -147,6 +157,44 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
     # ------------------------------------------------------------------ #
     # Setup helpers
     # ------------------------------------------------------------------ #
+
+    def _setup_scroll(self) -> None:
+        """Scroll mode: every match of a mode on one strip, scrolled right to left.
+
+        Cards are drawn by a second renderer at ``scroll_settings.card_width``
+        (the full panel width would show one match per screen). Vegas uses
+        the same cards.
+        """
+        scroll_cfg = self.config.get("scroll_settings", {}) or {}
+        self.card_width = max(64, min(int(scroll_cfg.get("card_width", 128) or 128),
+                                      self.display_width))
+        self.card_gap = max(0, int(scroll_cfg.get("gap_between_cards", 24) or 0))
+        self.scroll_pixels_per_second = float(scroll_cfg.get("scroll_speed", 100) or 100)
+        self.card_renderer = CricketRenderer(self.card_width, self.display_height,
+                                             self.config, tz=self.renderer.tz)
+
+        style = self.config.get("display_style", "scroll")
+        self.scroll_helper = None
+        self._scroll_settings = None
+        if style == "scroll" and ScrollHelper is not None:
+            self.scroll_helper = ScrollHelper(self.display_width, self.display_height,
+                                              self.logger)
+            self.scroll_helper.set_dynamic_duration_settings(
+                enabled=True, min_duration=10, max_duration=600, buffer=0.05)
+            if _scroll_config is not None:
+                self._scroll_settings = _scroll_config.configure(
+                    self.scroll_helper,
+                    plugin_config={"scroll_pixels_per_second": self.scroll_pixels_per_second},
+                    global_config=getattr(self, "global_config", None) or {},
+                    display_manager=self.display_manager,
+                    plugin_logger=self.logger,
+                )
+            else:
+                self.scroll_helper.set_scroll_speed(self.scroll_pixels_per_second)
+        # Read by the core to run this plugin at the scrolling frame rate.
+        self.enable_scrolling = getattr(self, "scroll_helper", None) is not None
+        self._scroll_mode: Optional[str] = None     # the mode the strip holds
+        self._scroll_done = False                   # that strip has scrolled through
 
     def _load_competitions(self) -> List[Dict[str, Any]]:
         path = _PLUGIN_DIR / "competitions.json"
@@ -286,6 +334,8 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
                 if download_missing_logo("cricket", team.get("id", ""), abbr, path, url):
                     retry_at.pop(abbr, None)
                     self.renderer.forget_crest(team)
+                    if getattr(self, "card_renderer", None) is not None:
+                        self.card_renderer.forget_crest(team)
                     continue
             except Exception as e:
                 self.logger.debug("Logo download failed for %s: %s", abbr, e)
@@ -335,14 +385,16 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
             match = matches[idx]
         return match
 
-    def _render_match(self, mode: str, match: Dict[str, Any]) -> Image.Image:
+    def _render_match(self, mode: str, match: Dict[str, Any],
+                      renderer: Optional[CricketRenderer] = None) -> Image.Image:
+        renderer = renderer or self.renderer
         if mode == MODE_LIVE:
             if match.get("is_test"):
-                return self.renderer.render_live_test(match)
-            return self.renderer.render_live_limited_overs(match)
+                return renderer.render_live_test(match)
+            return renderer.render_live_limited_overs(match)
         if mode == MODE_RECENT:
-            return self.renderer.render_recent(match)
-        return self.renderer.render_upcoming(match)
+            return renderer.render_recent(match)
+        return renderer.render_upcoming(match)
 
     def display(self, display_mode: str = None, force_clear: bool = False) -> bool:
         if not self.is_enabled:
@@ -353,6 +405,9 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
             return False
         if not self.mode_enabled.get(mode, True):
             return False
+
+        if getattr(self, "scroll_helper", None) is not None:
+            return self._display_scroll(mode, force_clear)
 
         match = self._current_match(mode)
         if match is None:
@@ -374,6 +429,102 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
             self.logger.warning("Cricket display push failed: %s", e)
             return False
         return True
+
+    def _display_scroll(self, mode: str, force_clear: bool) -> bool:
+        """One frame of the scrolling strip for ``mode``.
+
+        The strip is rebuilt when the mode changes, on a fresh start
+        (force_clear), and after it has scrolled through once -- so live
+        scores are at most one pass old.
+        """
+        helper = self.scroll_helper
+        if (force_clear or self._scroll_mode != mode or self._scroll_done
+                or not helper.has_strip()):
+            if not self._build_strip(mode):
+                return False
+
+        hold = getattr(self._scroll_settings, "frame_hold", 1) if self._scroll_settings else 1
+        try:
+            self.display_manager.set_scrolling_state(True, frame_hold=hold)
+        except TypeError:          # an older display manager
+            self.display_manager.set_scrolling_state(True)
+        except AttributeError:
+            pass
+        if hasattr(self.display_manager, "process_deferred_updates"):
+            self.display_manager.process_deferred_updates()
+
+        helper.update_scroll_position()
+        frame = helper.get_visible_portion()
+        if frame is None:
+            return False
+        try:
+            self.display_manager.image.paste(frame, (0, 0))
+            self.display_manager.update_display()
+        except Exception as e:
+            self.logger.warning("Cricket display push failed: %s", e)
+            return False
+        self._last_display_mode = mode
+        if helper.is_scroll_complete():
+            self._scroll_done = True
+        return True
+
+    def _scroll_cards(self, mode: str) -> List[Image.Image]:
+        cards = []
+        for match in self._matches_for_mode(mode):
+            try:
+                cards.append(self._render_match(mode, match, self.card_renderer))
+            except Exception as e:
+                self.logger.warning("Cricket card render failed (%s): %s", mode, e)
+        return cards
+
+    def _build_strip(self, mode: str) -> bool:
+        cards = self._scroll_cards(mode)
+        if not cards:
+            self._scroll_mode = None
+            return False
+        # A blank panel's width at the end too, so the last card scrolls all
+        # the way off before the strip ends.
+        tail = Image.new("RGB", (self.display_width, self.display_height), (0, 0, 0))
+        self.scroll_helper.create_scrolling_image(
+            cards + [tail], item_gap=self.card_gap, element_gap=0)
+        self._scroll_mode = mode
+        self._scroll_done = False
+        return True
+
+    def _strip_seconds(self, mode: str) -> Optional[float]:
+        """How long one pass of ``mode``'s strip takes on the panel."""
+        n = len(self._matches_for_mode(mode))
+        if not n:
+            return None
+        width = (self.display_width                      # lead-in
+                 + n * self.card_width + n * self.card_gap
+                 + self.display_width)                   # run-out
+        speed = (getattr(self._scroll_settings, "pixels_per_second", None)
+                 or self.scroll_pixels_per_second)
+        return width / max(1.0, float(speed)) + 1.0
+
+    def is_cycle_complete(self) -> bool:
+        if getattr(self, "scroll_helper", None) is None:
+            return True
+        return self._scroll_done
+
+    def reset_cycle_state(self) -> None:
+        if BasePlugin:
+            try:
+                super().reset_cycle_state()
+            except Exception:
+                pass
+        # Start the next slot from a fresh strip with current scores.
+        self._scroll_done = False
+        self._scroll_mode = None
+
+    def get_dynamic_duration_cap(self) -> Optional[float]:
+        if getattr(self, "scroll_helper", None) is not None:
+            dyn = self.config.get("dynamic_duration", {}) or {}
+            return float(dyn.get("max_duration_seconds", 300) or 300)
+        if BasePlugin:
+            return super().get_dynamic_duration_cap()
+        return None
 
     def _display_timezone(self):
         """The LEDMatrix timezone setting, or None for the Pi's local zone."""
@@ -420,6 +571,10 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
         if not matches:
             return self.display_duration
 
+        if getattr(self, "scroll_helper", None) is not None:
+            # One full pass of the strip; is_cycle_complete ends it exactly.
+            return self._strip_seconds(mode) or self.display_duration
+
         # Explicit mode-level override wins.
         mode_durations = self.config.get("mode_durations", {}) or {}
         override = mode_durations.get(f"{mode.replace('cricketplus_', '')}_mode_duration")
@@ -435,6 +590,8 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
         return per
 
     def supports_dynamic_duration(self) -> bool:
+        if getattr(self, "scroll_helper", None) is not None:
+            return True     # the strip says when it has been shown in full
         return bool((self.config.get("dynamic_duration", {}) or {}).get("enabled", False))
 
     # ------------------------------------------------------------------ #
@@ -576,7 +733,7 @@ class CricketPlusPlugin(BasePlugin if BasePlugin else object):
                 continue
             for match in self._matches_for_mode(mode):
                 try:
-                    cards.append(self._render_match(mode, match))
+                    cards.append(self._render_match(mode, match, self.card_renderer))
                 except Exception as e:
                     self.logger.debug("Vegas card render failed: %s", e)
         return cards or None

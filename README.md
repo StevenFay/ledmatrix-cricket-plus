@@ -38,6 +38,24 @@ installed alongside the original. Enable one or the other.
 
 Live matches take priority in the rotation when `live_priority` is on.
 
+### Scroll or switch
+
+`display_style` sets how each mode is shown:
+
+- **`scroll`** (default): every match in the mode scrolls across the panel,
+  right to left, as one strip of match cards, like the other sports boards.
+  The strip runs once per slot and is rebuilt with the latest scores before
+  it runs again.
+- **`switch`**: one match at a time, each for its game duration.
+
+`scroll_settings` tunes the ticker:
+
+| Setting | Default | |
+|---|---|---|
+| `scroll_speed` | 100 | Pixels per second. Whole multiples of the panel refresh (100 on a 100Hz panel) scroll the smoothest. |
+| `card_width` | 128 | Width of each match card, capped at the panel width. Vegas mode uses the same cards. |
+| `gap_between_cards` | 24 | Blank pixels between cards. |
+
 ## How series discovery works
 
 Unlike most sports, cricket has **no single stable league id** on ESPN — it is
@@ -184,6 +202,7 @@ or in the card's top corners (`edges`).
 
 ```bash
 python -m unittest test_cricket_plugin   # needs Pillow + requests
+LEDMATRIX_CORE=~/LEDMatrix python3 test_scroll_mode.py   # scroll mode, needs the core
 ```
 
 Covers the base-6 overs conversion, run-rate math, format normalization, all

@@ -1,0 +1,45 @@
+{
+  "id": "cricket-plus",
+  "name": "Cricket Plus",
+  "version": "1.0.0",
+  "author": "StevenFay",
+  "description": "ChuckBuilds' Cricket Scoreboard with team logos that download, country flags for national sides, and small crests beside each team's score. Tests, ODIs, T20Is, BBL, IPL, Sheffield Shield and more from ESPN.",
+  "category": "sports",
+  "tags": [
+    "cricket",
+    "ipl",
+    "big-bash",
+    "t20",
+    "test-cricket",
+    "odi",
+    "sports",
+    "scoreboard",
+    "live-scores",
+    "flags"
+  ],
+  "display_modes": [
+    "cricketplus_live",
+    "cricketplus_recent",
+    "cricketplus_upcoming"
+  ],
+  "last_updated": "2026-10-20",
+  "stars": 0,
+  "downloads": 0,
+  "verified": false,
+  "screenshot": "",
+  "repo": "https://github.com/StevenFay/ledmatrix-cricket-plus",
+  "entry_point": "manager.py",
+  "class_name": "CricketPlusPlugin",
+  "config_schema": "config_schema.json",
+  "compatible_versions": [
+    ">=2.0.0"
+  ],
+  "versions": [
+    {
+      "version": "1.0.0",
+      "released": "2026-10-20",
+      "ledmatrix_min_version": "2.0.0",
+      "notes": "First release, based on ChuckBuilds' cricket-scoreboard 1.3.3 (ledmatrix-plugins d43e302). Team logos download again (ESPN's \"logo\" field), with retries and no restart needed; national sides show their country's flag (254 countries, flag-icons, MIT); crests sit small beside each team's score (crest_layout). Plugin id cricket-plus, display modes cricketplus_live / _recent / _upcoming, so it can sit beside the original."
+    }
+  ]
+}

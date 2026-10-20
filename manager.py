@@ -1,0 +1,656 @@
+"""
+Cricket Scoreboard plugin.
+
+CricketPlusPlugin orchestrates series discovery, data fetching, match
+categorization (live / recent / upcoming), logo/flag resolution and per-mode
+rotation. It mirrors the lifecycle and config surface of the other sports
+scoreboard plugins (see soccer-scoreboard/manager.py) while using a cricket-
+specific data model and renderer.
+
+Display modes: cricketplus_live, cricketplus_recent, cricketplus_upcoming.
+"""
+
+import json
+import logging
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+from PIL import Image
+
+# Guarded BasePlugin import so this module also compiles / runs standalone
+# (e.g. under the test harness) without the core LEDMatrix package present.
+try:
+    from src.plugin_system.base_plugin import BasePlugin, VegasDisplayMode
+except ImportError:
+    BasePlugin = None
+    VegasDisplayMode = None
+
+from cricket_data_fetcher import CricketDataFetcher
+from cricket_renderer import CricketRenderer
+
+try:
+    from cricket_logo_downloader import download_missing_logo, is_placeholder_logo
+except ImportError:  # pragma: no cover
+    download_missing_logo = None
+    is_placeholder_logo = None
+
+logger = logging.getLogger(__name__)
+
+_PLUGIN_DIR = Path(__file__).resolve().parent
+
+MODE_LIVE = "cricketplus_live"
+MODE_RECENT = "cricketplus_recent"
+MODE_UPCOMING = "cricketplus_upcoming"
+
+# ESPN competition keys that represent bundled national-team flags rather than
+# auto-downloaded franchise logos.
+_INTERNATIONAL_KEY = "international"
+
+#: Seconds before a team whose logo download failed is tried again.
+_LOGO_RETRY_SECONDS = 30 * 60
+
+
+class CricketPlusPlugin(BasePlugin if BasePlugin else object):
+    """Cricket scoreboard plugin (international + major domestic T20 leagues)."""
+
+    def __init__(self, plugin_id, config, display_manager, cache_manager,
+                 plugin_manager):
+        if BasePlugin:
+            super().__init__(plugin_id, config, display_manager, cache_manager,
+                             plugin_manager)
+
+        self.plugin_id = plugin_id
+        self.config = config or {}
+        self.display_manager = display_manager
+        self.cache_manager = cache_manager
+        self.plugin_manager = plugin_manager
+        # Keep BasePlugin's logger, which carries the plugin id; the module
+        # logger is only a stand-in when running without the core.
+        if not BasePlugin or not getattr(self, "logger", None):
+            self.logger = logger
+
+        self.is_enabled = self.config.get("enabled", False)
+
+        if hasattr(display_manager, "matrix") and display_manager.matrix is not None:
+            self.display_width = display_manager.matrix.width
+            self.display_height = display_manager.matrix.height
+        else:
+            self.display_width = getattr(display_manager, "width", 128)
+            self.display_height = getattr(display_manager, "height", 32)
+
+        # Load the curated competition seed list.
+        self.competitions = self._load_competitions()
+
+        # Durations / intervals.
+        self.display_duration = float(self.config.get("display_duration", 15))
+        self.live_game_duration = float(self.config.get("live_game_duration", 20))
+        self.non_favorite_live_game_duration = float(
+            self.config.get("non_favorite_live_game_duration", 0))
+        self.recent_game_duration = float(self.config.get("recent_game_duration", 15))
+        self.upcoming_game_duration = float(self.config.get("upcoming_game_duration", 15))
+        self.update_interval = int(self.config.get("update_interval_seconds", 3600))
+        self.live_update_interval = int(self.config.get("live_update_interval", 30))
+        self.recent_games_to_show = int(self.config.get("recent_games_to_show", 5))
+        self.upcoming_games_to_show = int(self.config.get("upcoming_games_to_show", 5))
+        self.live_priority = bool(self.config.get("live_priority", True))
+
+        self.favorite_teams = [t.lower() for t in self.config.get("favorite_teams", [])]
+        self.exclude_teams = [t.lower() for t in self.config.get("exclude_teams", [])]
+        self.show_favorite_teams_only = bool(
+            self.config.get("show_favorite_teams_only", False))
+
+        display_modes = self.config.get("display_modes", {}) or {}
+        self.mode_enabled = {
+            MODE_LIVE: display_modes.get("live", True),
+            MODE_RECENT: display_modes.get("recent", True),
+            MODE_UPCOMING: display_modes.get("upcoming", True),
+        }
+
+        bg_cfg = self.config.get("background_service", {}) or {}
+        req_timeout = int(bg_cfg.get("request_timeout", 30))
+
+        self.fetcher = CricketDataFetcher(cache_manager, self.config,
+                                          self.competitions, request_timeout=req_timeout)
+        self.renderer = CricketRenderer(self.display_width, self.display_height,
+                                        self.config, tz=self._display_timezone())
+        # The mode display() last drew. The core asks for the slot length
+        # after drawing, without naming the mode; see get_cycle_duration.
+        self._last_display_mode: Optional[str] = None
+
+        # No background data service: every fetch runs synchronously in
+        # update() through self.fetcher. The service used to be created here
+        # and never used, and because it is a process-wide singleton, creating
+        # it could size the shared worker pool for every other plugin.
+
+        # Categorized match state.
+        self._lock = threading.Lock()
+        self.live_matches: List[Dict[str, Any]] = []
+        self.recent_matches: List[Dict[str, Any]] = []
+        self.upcoming_matches: List[Dict[str, Any]] = []
+
+        self._last_update = 0.0
+
+        # Per-mode rotation state.
+        self._mode_index: Dict[str, int] = {MODE_LIVE: 0, MODE_RECENT: 0, MODE_UPCOMING: 0}
+        self._mode_item_start: Dict[str, float] = {}
+
+        self.logos_dir = _PLUGIN_DIR / "assets" / "logos"
+        self.logos_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info("Cricket scoreboard initialized (%dx%d), %d competitions seeded",
+                         self.display_width, self.display_height, len(self.competitions))
+
+    # ------------------------------------------------------------------ #
+    # Setup helpers
+    # ------------------------------------------------------------------ #
+
+    def _load_competitions(self) -> List[Dict[str, Any]]:
+        path = _PLUGIN_DIR / "competitions.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.error("Failed to load competitions.json: %s", e)
+            return [{"key": "international", "name": "International", "search_terms": None}]
+
+    # ------------------------------------------------------------------ #
+    # Filtering
+    # ------------------------------------------------------------------ #
+
+    def _match_has_team(self, match: Dict[str, Any], names: List[str]) -> bool:
+        for team in match.get("teams", []):
+            hay = f"{team.get('name', '')} {team.get('abbr', '')} {team.get('short_name', '')}".lower()
+            if any(n and n in hay for n in names):
+                return True
+        return False
+
+    def _keep_match(self, match: Dict[str, Any]) -> bool:
+        if self.exclude_teams and self._match_has_team(match, self.exclude_teams):
+            return False
+        # show_favorite_teams_only only constrains international matches; domestic
+        # competitions are already the user's chosen favorites.
+        if (self.show_favorite_teams_only and self.favorite_teams
+                and match.get("competition_key") == _INTERNATIONAL_KEY):
+            if not self._match_has_team(match, self.favorite_teams):
+                return False
+        return True
+
+    def _match_is_favorite(self, match: Dict[str, Any]) -> bool:
+        return bool(self.favorite_teams) and self._match_has_team(match, self.favorite_teams)
+
+    # ------------------------------------------------------------------ #
+    # Update
+    # ------------------------------------------------------------------ #
+
+    def update(self) -> None:
+        if not self.is_enabled:
+            return
+        now = time.time()
+        # Faster refresh when live content is present -- or due: a match whose
+        # start time has passed but was still "pre" at the last fetch. Without
+        # this the hourly interval left a match that had just started
+        # unnoticed for up to an hour, so live_priority never fired for it.
+        has_live = bool(self.live_matches) or self._upcoming_has_started(now)
+        interval = self.live_update_interval if has_live else self.update_interval
+        if now - self._last_update < interval:
+            return
+        self._last_update = now
+
+        try:
+            ttl = self.live_update_interval if has_live else self.update_interval
+            matches = self.fetcher.fetch_matches(ttl=ttl)
+        except Exception as e:
+            self.logger.warning("Cricket fetch_matches failed: %s", e)
+            return
+
+        live, recent, upcoming = [], [], []
+        for m in matches:
+            if not self._keep_match(m):
+                continue
+            state = m.get("state")
+            if state == "in":
+                live.append(m)
+            elif state == "post":
+                recent.append(m)
+            else:
+                upcoming.append(m)
+
+        # Sort: favorites first for live; most-recent-first for recent; soonest
+        # first for upcoming.
+        live.sort(key=lambda m: (not self._match_is_favorite(m),
+                                 m.get("start_time_utc") or _min_dt()))
+        recent.sort(key=lambda m: m.get("start_time_utc") or _min_dt(), reverse=True)
+        upcoming.sort(key=lambda m: m.get("start_time_utc") or _max_dt())
+
+        recent = recent[: self.recent_games_to_show]
+        upcoming = upcoming[: self.upcoming_games_to_show]
+
+        # Download every team's ESPN logo the renderer has no bundled flag
+        # for. National teams used to be skipped outright, so a side without
+        # one of the bundled flags (Netherlands, Scotland, a women's XI named
+        # "Australia Women", ...) only ever drew a placeholder.
+        for m in live + recent + upcoming:
+            self._ensure_logos(m)
+
+        with self._lock:
+            self.live_matches = live
+            self.recent_matches = recent
+            self.upcoming_matches = upcoming
+
+        self.logger.info("Cricket update: %d live, %d recent, %d upcoming",
+                         len(live), len(recent), len(upcoming))
+
+    def _upcoming_has_started(self, now: float) -> bool:
+        """Whether an upcoming match's start time passed in the last 12h.
+
+        Bounded so a fixture ESPN never moves off "pre" (abandoned without a
+        result) cannot hold the fast live cadence forever.
+        """
+        with self._lock:
+            upcoming = list(self.upcoming_matches)
+        for m in upcoming:
+            start = m.get("start_time_utc")
+            if not hasattr(start, "timestamp"):
+                continue
+            if 0 <= now - start.timestamp() <= 12 * 3600:
+                return True
+        return False
+
+    def _ensure_logos(self, match: Dict[str, Any]) -> None:
+        if download_missing_logo is None:
+            return
+        retry_at = self.__dict__.setdefault("_logo_retry_at", {})
+        now = time.time()
+        for team in match.get("teams", []):
+            abbr = (team.get("abbr") or "").upper()
+            abbr = "".join(c for c in abbr if c.isalnum() or c in ("&", "_"))
+            url = team.get("logo_url")
+            if not abbr or not url:
+                continue
+            if self.renderer.has_bundled_flag(team):
+                continue        # the renderer draws the bundled flag first
+            path = self.logos_dir / f"{abbr}.png"
+            if path.parent != self.logos_dir:
+                continue
+            # 1.3.3 and earlier saved a placeholder under the logo's own name
+            # when a download failed, which this check then took for the logo.
+            if path.exists() and not (is_placeholder_logo and is_placeholder_logo(path)):
+                continue
+            if now < retry_at.get(abbr, 0.0):
+                continue
+            try:
+                if download_missing_logo("cricket", team.get("id", ""), abbr, path, url):
+                    retry_at.pop(abbr, None)
+                    self.renderer.forget_crest(team)
+                    continue
+            except Exception as e:
+                self.logger.debug("Logo download failed for %s: %s", abbr, e)
+            retry_at[abbr] = now + _LOGO_RETRY_SECONDS
+
+    # ------------------------------------------------------------------ #
+    # Display
+    # ------------------------------------------------------------------ #
+
+    def _matches_for_mode(self, mode: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            if mode == MODE_LIVE:
+                return list(self.live_matches)
+            if mode == MODE_RECENT:
+                return list(self.recent_matches)
+            if mode == MODE_UPCOMING:
+                return list(self.upcoming_matches)
+        return []
+
+    def _per_item_duration(self, mode: str, match: Optional[Dict[str, Any]]) -> float:
+        if mode == MODE_LIVE:
+            if (self.non_favorite_live_game_duration > 0 and match is not None
+                    and not self._match_is_favorite(match)):
+                return self.non_favorite_live_game_duration
+            return self.live_game_duration
+        if mode == MODE_RECENT:
+            return self.recent_game_duration
+        if mode == MODE_UPCOMING:
+            return self.upcoming_game_duration
+        return self.display_duration
+
+    def _current_match(self, mode: str) -> Optional[Dict[str, Any]]:
+        matches = self._matches_for_mode(mode)
+        if not matches:
+            return None
+        idx = self._mode_index.get(mode, 0) % len(matches)
+        match = matches[idx]
+
+        now = time.time()
+        start = self._mode_item_start.get(mode)
+        if start is None:
+            self._mode_item_start[mode] = now
+        elif now - start >= self._per_item_duration(mode, match):
+            idx = (idx + 1) % len(matches)
+            self._mode_index[mode] = idx
+            self._mode_item_start[mode] = now
+            match = matches[idx]
+        return match
+
+    def _render_match(self, mode: str, match: Dict[str, Any]) -> Image.Image:
+        if mode == MODE_LIVE:
+            if match.get("is_test"):
+                return self.renderer.render_live_test(match)
+            return self.renderer.render_live_limited_overs(match)
+        if mode == MODE_RECENT:
+            return self.renderer.render_recent(match)
+        return self.renderer.render_upcoming(match)
+
+    def display(self, display_mode: str = None, force_clear: bool = False) -> bool:
+        if not self.is_enabled:
+            return False
+
+        mode = display_mode or self._pick_default_mode()
+        if mode not in (MODE_LIVE, MODE_RECENT, MODE_UPCOMING):
+            return False
+        if not self.mode_enabled.get(mode, True):
+            return False
+
+        match = self._current_match(mode)
+        if match is None:
+            return False
+        self._last_display_mode = mode
+
+        try:
+            image = self._render_match(mode, match)
+        except Exception as e:
+            self.logger.warning("Cricket render failed (%s): %s", mode, e)
+            return False
+
+        try:
+            if force_clear and hasattr(self.display_manager, "clear"):
+                self.display_manager.clear()
+            self.display_manager.image.paste(image, (0, 0))
+            self.display_manager.update_display()
+        except Exception as e:
+            self.logger.warning("Cricket display push failed: %s", e)
+            return False
+        return True
+
+    def _display_timezone(self):
+        """The LEDMatrix timezone setting, or None for the Pi's local zone."""
+        name = None
+        try:
+            config_manager = getattr(self.plugin_manager, "config_manager", None)
+            if config_manager is not None:
+                name = config_manager.get_timezone()
+        except Exception:
+            name = None
+        if not name:
+            return None
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            self.logger.warning("Unknown timezone %r; using the system zone", name)
+            return None
+
+    def _pick_default_mode(self) -> str:
+        if self.mode_enabled.get(MODE_LIVE, True) and self.live_matches:
+            return MODE_LIVE
+        if self.mode_enabled.get(MODE_RECENT, True) and self.recent_matches:
+            return MODE_RECENT
+        if self.mode_enabled.get(MODE_UPCOMING, True) and self.upcoming_matches:
+            return MODE_UPCOMING
+        return MODE_LIVE
+
+    # ------------------------------------------------------------------ #
+    # Duration / cycling contract
+    # ------------------------------------------------------------------ #
+
+    def get_display_duration(self, display_mode: str = None) -> float:
+        return self.get_cycle_duration(display_mode) or self.display_duration
+
+    def get_cycle_duration(self, display_mode: str = None) -> Optional[float]:
+        # The core calls get_display_duration() with no mode, right after
+        # display(mode). Falling straight back to _pick_default_mode timed
+        # every mode as live-or-recent: Upcoming ran for the Recent total
+        # whenever recent matches existed, and mode_durations applied to the
+        # wrong mode.
+        mode = (display_mode or getattr(self, "_last_display_mode", None)
+                or self._pick_default_mode())
+        matches = self._matches_for_mode(mode)
+        if not matches:
+            return self.display_duration
+
+        # Explicit mode-level override wins.
+        mode_durations = self.config.get("mode_durations", {}) or {}
+        override = mode_durations.get(f"{mode.replace('cricketplus_', '')}_mode_duration")
+        if override:
+            return float(override)
+
+        per = sum(self._per_item_duration(mode, m) for m in matches)
+        dyn = self.config.get("dynamic_duration", {}) or {}
+        if dyn.get("enabled", False):
+            lo = float(dyn.get("min_duration_seconds", 30))
+            hi = float(dyn.get("max_duration_seconds", 300))
+            return max(lo, min(per, hi))
+        return per
+
+    def supports_dynamic_duration(self) -> bool:
+        return bool((self.config.get("dynamic_duration", {}) or {}).get("enabled", False))
+
+    # ------------------------------------------------------------------ #
+    # Live priority contract
+    # ------------------------------------------------------------------ #
+
+    def has_live_priority(self) -> bool:
+        return self.is_enabled and self.live_priority
+
+    # --- Vegas ticker weighting ------------------------------------------
+    #
+    # With display.vegas_scroll.live_in_ticker set, the marquee keeps running
+    # through a live game and plugins can claim more than one slot per cycle.
+    # The core already gives any plugin with live content `live_weight`; this
+    # exists for the one thing the core cannot work out for itself, which is
+    # *whose* game is live. See the core's PLUGIN_API_REFERENCE, "Vegas scroll
+    # hooks", and ADVANCED_FEATURES, "Live content in the ticker".
+
+    def get_vegas_priority_weight(self):
+        """Slots per Vegas cycle: more when a favorite team is playing.
+
+        Returns None when nothing is live, which leaves the decision to the
+        core rather than asserting a weight of 1 -- the core may have its own
+        reason to boost this plugin later.
+        """
+        try:
+            if not (self.has_live_priority() and self.has_live_content()):
+                return None
+            vegas = (self.global_config or {}).get('display', {}).get(
+                'vegas_scroll', {})
+            if self._favorite_team_is_live():
+                return vegas.get('favorite_live_weight', 5)
+            return vegas.get('live_weight', 3)
+        except Exception:
+            # Never let a weighting question break the rotation; the core
+            # treats an exception as weight 1 anyway, and None says the same
+            # thing more cheaply.
+            return None
+
+    def _favorite_team_is_live(self):
+        """Whether any live game or fight involves a configured favorite.
+
+        The sports plugins do not share one data shape, so this enumerates the
+        real ones rather than assuming. An earlier version looked only for an
+        attribute holding `live_games` alongside `favorite_teams`, which was
+        true of five plugins and quietly false for four others -- they simply
+        never reported a favorite, and no test noticed because the tests used
+        the assumed shape rather than each plugin's own.
+
+        Handled:
+
+        * managers held directly on the plugin *and* inside a dict such as
+          ``self._managers`` (nrl, afl)
+        * ``live_games`` (most) and ``live_matches`` (cricket)
+        * ``favorite_teams`` (most) and ``favorite_fighters`` (ufc)
+        * identifiers ``home_abbr``/``away_abbr``, ``home_id``/``away_id``,
+          ``fighter1_name``/``fighter2_name``, and cricket's nested
+          ``teams: [{name, abbr, short_name}]``
+        * ``active_celebration["game"]``, a snapshot the live manager keeps
+          precisely because the game leaves ``live_games`` while the
+          celebration is still on screen
+        """
+        for holder in self._favorite_scan_targets():
+            favorites = (getattr(holder, 'favorite_teams', None)
+                         or getattr(holder, 'favorite_fighters', None))
+            if not favorites:
+                continue
+            wanted = {str(f).strip().lower() for f in favorites if f}
+            if not wanted:
+                continue
+            for game in self._favorite_scan_games(holder):
+                if self._game_involves(game, wanted):
+                    return True
+        return False
+
+    def _favorite_scan_targets(self):
+        """Objects that might carry live content: attributes, and dict values.
+
+        nrl and afl keep their per-league managers in a ``self._managers``
+        dict, so walking attribute values alone finds the dict and stops.
+        """
+        for value in list(vars(self).values()):
+            yield value
+            if isinstance(value, dict):
+                for nested in list(value.values()):
+                    yield nested
+
+    @staticmethod
+    def _favorite_scan_games(holder):
+        """Every game/fight on a holder that a favorite could be playing in."""
+        for attr in ('live_games', 'live_matches'):
+            for game in (getattr(holder, attr, None) or []):
+                if isinstance(game, dict):
+                    yield game
+        celebration = getattr(holder, 'active_celebration', None)
+        if isinstance(celebration, dict) and isinstance(celebration.get('game'), dict):
+            yield celebration['game']
+
+    @staticmethod
+    def _game_involves(game, wanted):
+        """Whether a game/fight involves one of the wanted names."""
+        for field in ('home_abbr', 'away_abbr', 'home_id', 'away_id',
+                      'fighter1_name', 'fighter2_name'):
+            value = game.get(field)
+            if value is not None and str(value).strip().lower() in wanted:
+                return True
+        # Cricket nests its sides and matches on any of three names, by
+        # substring -- "india" should match "India Women". Mirrors that
+        # plugin's own _match_has_team rather than inventing a second rule.
+        for team in (game.get('teams') or []):
+            if not isinstance(team, dict):
+                continue
+            hay = " ".join(str(team.get(k) or '') for k in
+                           ('name', 'abbr', 'short_name')).lower()
+            if any(name in hay for name in wanted):
+                return True
+        return False
+
+    def has_live_content(self) -> bool:
+        if not self.is_enabled or not self.mode_enabled.get(MODE_LIVE, True):
+            return False
+        with self._lock:
+            return len(self.live_matches) > 0
+
+    def get_live_modes(self) -> List[str]:
+        return [MODE_LIVE] if self.has_live_content() else []
+
+    # ------------------------------------------------------------------ #
+    # Vegas hooks
+    # ------------------------------------------------------------------ #
+
+    def get_vegas_content_type(self) -> str:
+        return "multi"
+
+    def get_vegas_content(self) -> Optional[List[Image.Image]]:
+        cards: List[Image.Image] = []
+        for mode in (MODE_LIVE, MODE_RECENT, MODE_UPCOMING):
+            if not self.mode_enabled.get(mode, True):
+                continue
+            for match in self._matches_for_mode(mode):
+                try:
+                    cards.append(self._render_match(mode, match))
+                except Exception as e:
+                    self.logger.debug("Vegas card render failed: %s", e)
+        return cards or None
+
+    def get_vegas_display_mode(self):
+        if VegasDisplayMode is not None:
+            return VegasDisplayMode.SCROLL
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Config lifecycle
+    # ------------------------------------------------------------------ #
+
+    def validate_config(self, config: Dict[str, Any] = None) -> bool:
+        cfg = config if config is not None else self.config
+        if not isinstance(cfg, dict):
+            return False
+        comps = cfg.get("favorite_competitions", [])
+        if comps and not isinstance(comps, list):
+            return False
+        teams = cfg.get("favorite_teams", [])
+        if teams and not isinstance(teams, list):
+            return False
+        return True
+
+    def on_config_change(self, new_config: Dict[str, Any]) -> None:
+        if BasePlugin:
+            try:
+                super().on_config_change(new_config)
+            except Exception:
+                self.logger.debug("BasePlugin on_config_change failed", exc_info=True)
+        # Re-run __init__ derived state without recreating the object, but
+        # preserve the lock in place -- another thread may be holding it
+        # inside update()/display(), and replacing it would break mutual
+        # exclusion.
+        lock = self._lock
+        old_fetcher = getattr(self, "fetcher", None)
+        self.__init__(self.plugin_id, new_config, self.display_manager,
+                      self.cache_manager, self.plugin_manager)
+        self._lock = lock
+        # The rebuilt fetcher opened its own HTTP session; close the old one
+        # rather than leak a connection pool per settings save.
+        old_session = getattr(old_fetcher, "session", None)
+        if old_session is not None:
+            try:
+                old_session.close()
+            except Exception as e:
+                self.logger.debug("Closing the previous HTTP session failed: %s", e)
+        # Force a re-discovery + refetch on next update.
+        self._last_update = 0.0
+
+    def get_info(self) -> Dict[str, Any]:
+        info = {}
+        if BasePlugin:
+            try:
+                info = super().get_info()
+            except Exception:
+                info = {}
+        info.update({
+            "name": "Cricket Scoreboard",
+            "enabled": self.is_enabled,
+            "live": len(self.live_matches),
+            "recent": len(self.recent_matches),
+            "upcoming": len(self.upcoming_matches),
+            "competitions": [c.get("key") for c in self.competitions],
+        })
+        return info
+
+
+def _min_dt():
+    from datetime import datetime, timezone
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _max_dt():
+    from datetime import datetime, timezone
+    return datetime.max.replace(tzinfo=timezone.utc)
